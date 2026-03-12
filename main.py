@@ -145,6 +145,7 @@ def moralis_get_json(url: str, attempt: int = 1) -> dict:
     headers = {"X-API-Key": MORALIS_API_KEY}
     resp = requests.get(url, headers=headers, timeout=60)
 
+    # retry for rate limits
     if resp.status_code == 429:
         if attempt >= MORALIS_MAX_RETRIES_429:
             raise RuntimeError(f"Moralis 429 after retries: {resp.text[:300]}")
@@ -152,9 +153,16 @@ def moralis_get_json(url: str, attempt: int = 1) -> dict:
         time.sleep(wait_sec)
         return moralis_get_json(url, attempt + 1)
 
+    # retry for temporary server errors
+    if resp.status_code in (500, 502, 503, 504):
+        if attempt >= MORALIS_MAX_RETRIES_429:
+            raise RuntimeError(f"Moralis {resp.status_code} after retries: {resp.text[:300]}")
+        wait_sec = MORALIS_RETRY_BASE_SEC * attempt
+        time.sleep(wait_sec)
+        return moralis_get_json(url, attempt + 1)
+
     resp.raise_for_status()
     return resp.json()
-
 
 def fetch_all_owners() -> List[Dict]:
     out = []
