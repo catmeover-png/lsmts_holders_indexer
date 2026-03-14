@@ -3,6 +3,8 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import requests
 import gspread
@@ -27,23 +29,47 @@ MAX_PAGES = 350
 MIN_BALANCE = 0.001
 MIN_CHANGE_PERCENT = 5
 
-REQUEST_SLEEP_SEC = 0.15
+REQUEST_SLEEP_SEC = 0.05   # уменьшили с 0.15
 
-RPC_BATCH_SIZE = 40
-RPC_SLEEP_SEC = 0.25
+# RPC — динамический batch size
+RPC_BATCH_SIZE_INIT = 80   # стартуем с большего
+RPC_BATCH_SIZE_MIN = 20
+RPC_BATCH_SIZE_MAX = 120
+RPC_SLEEP_SEC = 0.05       # уменьшили с 0.25
 RPC_MAX_RETRIES_429 = 8
 RPC_RETRY_BASE_SEC = 1.5
 RPC_RETRY_NON429 = 2
+RPC_MAX_WORKERS = 4        # параллельные потоки
 
 MORALIS_MAX_RETRIES_429 = 5
 MORALIS_RETRY_BASE_SEC = 3.0
 
-# sheet names
 SHEET_HOLDERS = "holders"
 SHEET_LABELS = "labels"
 SHEET_HISTORY = "history"
 SHEET_MOVEMENTS = "movements"
 SHEET_HOLDERS_RAW = "holders_raw"
+
+# =========================
+# THREAD-SAFE BATCH SIZE
+# =========================
+_batch_size_lock = threading.Lock()
+_current_batch_size = RPC_BATCH_SIZE_INIT
+
+def get_batch_size() -> int:
+    with _batch_size_lock:
+        return _current_batch_size
+
+def decrease_batch_size():
+    global _current_batch_size
+    with _batch_size_lock:
+        _current_batch_size = max(RPC_BATCH_SIZE_MIN, _current_batch_size // 2)
+        print(f"  [RPC] batch size decreased to {_current_batch_size}")
+
+def increase_batch_size():
+    global _current_batch_size
+    with _batch_size_lock:
+        _current_batch_size = min(RPC_BATCH_SIZE_MAX, int(_current_batch_size * 1.2))
 
 
 # =========================
@@ -52,7 +78,6 @@ SHEET_HOLDERS_RAW = "holders_raw"
 def now_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
-
 def n0(x) -> float:
     try:
         n = float(x)
@@ -60,10 +85,8 @@ def n0(x) -> float:
     except Exception:
         return 0.0
 
-
 def to_tokens(raw: str) -> float:
     return int(raw) / (10 ** TOKEN_DECIMALS)
-
 
 def chunks(lst, size):
     for i in range(0, len(lst), size):
@@ -82,18 +105,15 @@ def get_gspread_client():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-
 def get_spreadsheet():
     gc = get_gspread_client()
     return gc.open_by_key(SPREADSHEET_ID)
-
 
 def get_or_create_worksheet(spreadsheet, title: str, rows: int = 1000, cols: int = 20):
     try:
         return spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
         return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
-
 
 def clear_and_write(ws, values: List[List]):
     ws.clear()
@@ -109,7 +129,6 @@ def read_labels(spreadsheet) -> Dict[str, str]:
     values = ws.get_all_values()
     if len(values) <= 1:
         return {}
-
     out = {}
     for row in values[1:]:
         if not row:
@@ -120,13 +139,11 @@ def read_labels(spreadsheet) -> Dict[str, str]:
             out[addr] = label
     return out
 
-
 def read_previous_holders(spreadsheet) -> Dict[str, float]:
     ws = get_or_create_worksheet(spreadsheet, SHEET_HOLDERS)
     values = ws.get_all_values()
     if len(values) <= 1:
         return {}
-
     out = {}
     for row in values[1:]:
         if not row:
@@ -145,20 +162,16 @@ def moralis_get_json(url: str, attempt: int = 1) -> dict:
     headers = {"X-API-Key": MORALIS_API_KEY}
     resp = requests.get(url, headers=headers, timeout=60)
 
-    # retry for rate limits
     if resp.status_code == 429:
         if attempt >= MORALIS_MAX_RETRIES_429:
             raise RuntimeError(f"Moralis 429 after retries: {resp.text[:300]}")
-        wait_sec = MORALIS_RETRY_BASE_SEC * attempt
-        time.sleep(wait_sec)
+        time.sleep(MORALIS_RETRY_BASE_SEC * attempt)
         return moralis_get_json(url, attempt + 1)
 
-    # retry for temporary server errors
     if resp.status_code in (500, 502, 503, 504):
         if attempt >= MORALIS_MAX_RETRIES_429:
             raise RuntimeError(f"Moralis {resp.status_code} after retries: {resp.text[:300]}")
-        wait_sec = MORALIS_RETRY_BASE_SEC * attempt
-        time.sleep(wait_sec)
+        time.sleep(MORALIS_RETRY_BASE_SEC * attempt)
         return moralis_get_json(url, attempt + 1)
 
     resp.raise_for_status()
@@ -170,8 +183,11 @@ def fetch_all_owners() -> List[Dict]:
     seen_cursors = set()
     seen_signatures = set()
 
-    for _ in range(MAX_PAGES):
-        url = f"{MORALIS_BASE_URL}/erc20/{TOKEN_ADDRESS}/owners?chain={CHAIN}&limit={PAGE_LIMIT}&order=DESC"
+    for page_num in range(MAX_PAGES):
+        url = (
+            f"{MORALIS_BASE_URL}/erc20/{TOKEN_ADDRESS}/owners"
+            f"?chain={CHAIN}&limit={PAGE_LIMIT}&order=DESC"
+        )
         if cursor:
             url += f"&cursor={cursor}"
 
@@ -196,20 +212,17 @@ def fetch_all_owners() -> List[Dict]:
             if address and balance_raw:
                 bal = to_tokens(balance_raw)
                 if bal > 0:
-                    out.append({
-                        "address": address,
-                        "moralis_balance": bal,
-                    })
+                    out.append({"address": address, "moralis_balance": bal})
 
-        if not next_cursor:
-            break
-
-        if next_cursor in seen_cursors:
+        if not next_cursor or next_cursor in seen_cursors:
             break
 
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-        time.sleep(REQUEST_SLEEP_SEC)
+
+        # sleep только каждые 5 страниц
+        if page_num % 5 == 4:
+            time.sleep(REQUEST_SLEEP_SEC)
 
     dedup = {}
     for row in out:
@@ -226,7 +239,6 @@ def fetch_all_owners() -> List[Dict]:
 def pad64(addr: str) -> str:
     return addr.lower().replace("0x", "").rjust(64, "0")
 
-
 def is_429_response(resp: requests.Response, body_text: str, json_error=None) -> bool:
     if resp.status_code == 429:
         return True
@@ -236,12 +248,9 @@ def is_429_response(resp: requests.Response, body_text: str, json_error=None) ->
         err_text = json.dumps(json_error)
         if str(json_error.get("code")) == "429":
             return True
-        if "compute units per second" in err_text:
-            return True
-        if "throughput" in err_text.lower():
+        if "compute units per second" in err_text or "throughput" in err_text.lower():
             return True
     return False
-
 
 def make_balance_call(address: str, req_id: int) -> dict:
     return {
@@ -249,26 +258,16 @@ def make_balance_call(address: str, req_id: int) -> dict:
         "id": req_id,
         "method": "eth_call",
         "params": [
-            {
-                "to": TOKEN_ADDRESS,
-                "data": "0x70a08231" + pad64(address),
-            },
+            {"to": TOKEN_ADDRESS, "data": "0x70a08231" + pad64(address)},
             "latest",
         ],
     }
 
-
 def rpc_balance_of_batch(
     addresses: List[str],
     attempt_429: int = 1,
-    attempt_non429: int = 1
+    attempt_non429: int = 1,
 ) -> Dict[str, Tuple[str, float]]:
-    """
-    Returns:
-    {
-      address: ("verified", balance) | ("zero", 0.0) | ("rpc_error", 0.0)
-    }
-    """
     id_to_address = {}
     payload = []
 
@@ -281,6 +280,7 @@ def rpc_balance_of_batch(
         body = resp.text
 
         if is_429_response(resp, body):
+            decrease_batch_size()
             if attempt_429 >= RPC_MAX_RETRIES_429:
                 raise RuntimeError(f"RPC batch 429 after retries: {body[:300]}")
             wait_sec = RPC_RETRY_BASE_SEC * attempt_429
@@ -296,6 +296,9 @@ def rpc_balance_of_batch(
                 return rpc_balance_of_batch(addresses, attempt_429, attempt_non429 + 1)
             raise RuntimeError(f"Unexpected batch response: {str(data)[:300]}")
 
+        # Успешный батч — увеличиваем batch size
+        increase_batch_size()
+
         out = {address: ("rpc_error", 0.0) for address in addresses}
 
         for item in data:
@@ -308,11 +311,13 @@ def rpc_balance_of_batch(
                 err = item["error"]
                 err_text = json.dumps(err)
 
-                if str(err.get("code")) == "429" or "compute units per second" in err_text or "throughput" in err_text.lower():
+                if (str(err.get("code")) == "429"
+                        or "compute units per second" in err_text
+                        or "throughput" in err_text.lower()):
+                    decrease_batch_size()
                     if attempt_429 >= RPC_MAX_RETRIES_429:
-                        raise RuntimeError(f"RPC logical batch 429 after retries: {err_text}")
-                    wait_sec = RPC_RETRY_BASE_SEC * attempt_429
-                    time.sleep(wait_sec)
+                        raise RuntimeError(f"RPC logical 429 after retries: {err_text}")
+                    time.sleep(RPC_RETRY_BASE_SEC * attempt_429)
                     return rpc_balance_of_batch(addresses, attempt_429 + 1, attempt_non429)
 
                 out[address] = ("rpc_error", 0.0)
@@ -321,70 +326,98 @@ def rpc_balance_of_batch(
             raw_hex = item.get("result", "0x0")
             raw_int = int(raw_hex, 16)
             bal = raw_int / (10 ** TOKEN_DECIMALS)
-
-            if bal <= 0:
-                out[address] = ("zero", 0.0)
-            else:
-                out[address] = ("verified", bal)
+            out[address] = ("zero", 0.0) if bal <= 0 else ("verified", bal)
 
         return out
 
     except Exception as e:
         msg = str(e)
-
         if "429" in msg or "compute units per second" in msg:
+            decrease_batch_size()
             if attempt_429 >= RPC_MAX_RETRIES_429:
                 raise
-            wait_sec = RPC_RETRY_BASE_SEC * attempt_429
-            time.sleep(wait_sec)
+            time.sleep(RPC_RETRY_BASE_SEC * attempt_429)
             return rpc_balance_of_batch(addresses, attempt_429 + 1, attempt_non429)
 
         if attempt_non429 <= RPC_RETRY_NON429:
             time.sleep(1.0 * attempt_non429)
             return rpc_balance_of_batch(addresses, attempt_429, attempt_non429 + 1)
-
         raise
 
 
 # =========================
-# VERIFY
+# VERIFY — параллельная
 # =========================
 def verify_all(rows: List[Dict]) -> List[Dict]:
+    """
+    Фильтрует адреса с balance < MIN_BALANCE (им не нужна верификация),
+    остальные верифицирует параллельно в RPC_MAX_WORKERS потоках.
+    """
+    # Разделяем: мелкие балансы пропускаем RPC
+    skip_rpc = []
+    need_rpc = []
+    for r in rows:
+        if r["moralis_balance"] < MIN_BALANCE:
+            skip_rpc.append(r)
+        else:
+            need_rpc.append(r)
+
+    print(f"  [verify] total={len(rows)}, need_rpc={len(need_rpc)}, skip_rpc={len(skip_rpc)}")
+
+    results: Dict[str, Tuple[str, float]] = {}
+    lock = threading.Lock()
+
+    def process_batch(batch_addresses: List[str]):
+        batch_result = rpc_balance_of_batch(batch_addresses)
+        time.sleep(RPC_SLEEP_SEC)
+        with lock:
+            results.update(batch_result)
+
+    # Динамически нарезаем батчи по текущему batch size
+    def dynamic_batches(addr_list):
+        i = 0
+        while i < len(addr_list):
+            size = get_batch_size()
+            yield addr_list[i:i + size]
+            i += size
+
+    addresses = [r["address"] for r in need_rpc]
+    batches = list(dynamic_batches(addresses))
+
+    with ThreadPoolExecutor(max_workers=RPC_MAX_WORKERS) as executor:
+        futures = {executor.submit(process_batch, b): b for b in batches}
+        done = 0
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  [warn] batch error: {e}")
+            done += 1
+            if done % 10 == 0:
+                print(f"  [verify] {done}/{len(batches)} batches done")
+
+    # Собираем результат
     verified = []
 
-    for batch in chunks(rows, RPC_BATCH_SIZE):
-        addresses = [r["address"] for r in batch]
-        batch_result = rpc_balance_of_batch(addresses)
+    for r in need_rpc:
+        address = r["address"]
+        moralis_balance = r["moralis_balance"]
+        status, live_balance = results.get(address, ("rpc_error", 0.0))
+        verified.append({
+            "address": address,
+            "moralis_balance": moralis_balance,
+            "verified_balance": live_balance if status != "rpc_error" else "",
+            "verify_status": status,
+        })
 
-        for row in batch:
-            address = row["address"]
-            moralis_balance = row["moralis_balance"]
-
-            status, live_balance = batch_result.get(address, ("rpc_error", 0.0))
-
-            if status == "verified":
-                verified.append({
-                    "address": address,
-                    "moralis_balance": moralis_balance,
-                    "verified_balance": live_balance,
-                    "verify_status": "verified",
-                })
-            elif status == "zero":
-                verified.append({
-                    "address": address,
-                    "moralis_balance": moralis_balance,
-                    "verified_balance": 0.0,
-                    "verify_status": "zero",
-                })
-            else:
-                verified.append({
-                    "address": address,
-                    "moralis_balance": moralis_balance,
-                    "verified_balance": "",
-                    "verify_status": "rpc_error",
-                })
-
-        time.sleep(RPC_SLEEP_SEC)
+    # Мелкие балансы — доверяем Moralis, ставим статус "skipped"
+    for r in skip_rpc:
+        verified.append({
+            "address": r["address"],
+            "moralis_balance": r["moralis_balance"],
+            "verified_balance": r["moralis_balance"],
+            "verify_status": "skipped",
+        })
 
     return verified
 
@@ -452,20 +485,10 @@ def analyze_movements(
 # =========================
 def write_holders_raw(spreadsheet, verified_rows: List[Dict], labels: Dict[str, str]):
     ws = get_or_create_worksheet(
-        spreadsheet,
-        SHEET_HOLDERS_RAW,
-        rows=max(1000, len(verified_rows) + 20),
-        cols=10
+        spreadsheet, SHEET_HOLDERS_RAW,
+        rows=max(1000, len(verified_rows) + 20), cols=10
     )
-
-    values = [[
-        "wallet",
-        "moralis_balance",
-        "verified_balance",
-        "verify_status",
-        "label",
-    ]]
-
+    values = [["wallet", "moralis_balance", "verified_balance", "verify_status", "label"]]
     for r in verified_rows:
         values.append([
             r["address"],
@@ -474,35 +497,25 @@ def write_holders_raw(spreadsheet, verified_rows: List[Dict], labels: Dict[str, 
             r["verify_status"],
             labels.get(r["address"], "Retail"),
         ])
-
     clear_and_write(ws, values)
-
 
 def build_clean_holders(verified_rows: List[Dict]) -> List[Dict]:
     out = []
     for r in verified_rows:
-        if r["verify_status"] == "verified":
+        if r["verify_status"] in ("verified", "skipped"):
             bal = float(r["verified_balance"])
             if bal >= MIN_BALANCE:
-                out.append({
-                    "address": r["address"],
-                    "balance": bal,
-                })
+                out.append({"address": r["address"], "balance": bal})
     out.sort(key=lambda x: x["balance"], reverse=True)
     return out
 
-
 def write_holders(spreadsheet, holders: List[Dict], labels: Dict[str, str]):
     ws = get_or_create_worksheet(
-        spreadsheet,
-        SHEET_HOLDERS,
-        rows=max(1000, len(holders) + 20),
-        cols=10
+        spreadsheet, SHEET_HOLDERS,
+        rows=max(1000, len(holders) + 20), cols=10
     )
-
     total = sum(h["balance"] for h in holders)
     values = [["Wallet", "Balance", "Label", "% of total"]]
-
     for h in holders:
         pct = (h["balance"] / total * 100) if total > 0 else 0
         values.append([
@@ -511,46 +524,32 @@ def write_holders(spreadsheet, holders: List[Dict], labels: Dict[str, str]):
             labels.get(h["address"], "Retail"),
             f"{pct:.4f}%",
         ])
-
     clear_and_write(ws, values)
-
 
 def append_movements(spreadsheet, movements: List[Dict], timestamp: str):
     ws = get_or_create_worksheet(spreadsheet, SHEET_MOVEMENTS, rows=1000, cols=10)
     existing = ws.get_all_values()
-
     if not existing:
         ws.update([["Timestamp", "Action", "Wallet", "Label", "Was", "Now", "Change", "Change %"]])
-
     if not movements:
         return
-
     rows = []
     for m in movements:
         rows.append([
-            timestamp,
-            m["action"],
-            m["address"],
-            m["label"],
-            round(m["was"], 6),
-            round(m["now"], 6),
-            round(m["change"], 6),
-            f"{m['change_percent']:.2f}%",
+            timestamp, m["action"], m["address"], m["label"],
+            round(m["was"], 6), round(m["now"], 6),
+            round(m["change"], 6), f"{m['change_percent']:.2f}%",
         ])
-
     ws.append_rows(rows, value_input_option="RAW")
-
 
 def append_history(spreadsheet, holders: List[Dict], labels: Dict[str, str], timestamp: str):
     ws = get_or_create_worksheet(spreadsheet, SHEET_HISTORY, rows=1000, cols=10)
     existing = ws.get_all_values()
-
     if not existing:
         ws.update([["timestamp", "label", "balance", "total", "retail_%"]])
 
     total = sum(h["balance"] for h in holders)
     label_totals = {}
-
     for h in holders:
         label = labels.get(h["address"], "Retail")
         label_totals[label] = label_totals.get(label, 0) + h["balance"]
@@ -561,13 +560,11 @@ def append_history(spreadsheet, holders: List[Dict], labels: Dict[str, str], tim
     rows = []
     for label in sorted(label_totals.keys(), key=lambda x: (x != "Retail", x)):
         rows.append([
-            timestamp,
-            label,
+            timestamp, label,
             round(label_totals[label], 6),
             round(total, 6),
             round(retail_pct, 4),
         ])
-
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
 
@@ -576,32 +573,42 @@ def append_history(spreadsheet, holders: List[Dict], labels: Dict[str, str], tim
 # MAIN
 # =========================
 def main():
+    t0 = time.time()
     spreadsheet = get_spreadsheet()
 
     labels = read_labels(spreadsheet)
     previous_balances = read_previous_holders(spreadsheet)
 
+    print("Fetching owners from Moralis...")
     raw_rows = fetch_all_owners()
+    print(f"  Got {len(raw_rows)} owners in {time.time()-t0:.1f}s")
+
+    t1 = time.time()
+    print("Verifying via RPC...")
     verified_rows = verify_all(raw_rows)
+    print(f"  Verified in {time.time()-t1:.1f}s")
 
+    print("Writing sheets...")
+    t2 = time.time()
     write_holders_raw(spreadsheet, verified_rows, labels)
-
     clean_holders = build_clean_holders(verified_rows)
     write_holders(spreadsheet, clean_holders, labels)
 
     timestamp = now_stamp()
-
     movements = analyze_movements(clean_holders, previous_balances, labels)
     append_movements(spreadsheet, movements, timestamp)
     append_history(spreadsheet, clean_holders, labels, timestamp)
+    print(f"  Sheets written in {time.time()-t2:.1f}s")
 
     verified_ok = sum(1 for r in verified_rows if r["verify_status"] == "verified")
     zeros = sum(1 for r in verified_rows if r["verify_status"] == "zero")
     errors = sum(1 for r in verified_rows if r["verify_status"] == "rpc_error")
+    skipped = sum(1 for r in verified_rows if r["verify_status"] == "skipped")
 
     print(
-        f"Done. raw={len(raw_rows)}, verified_ok={verified_ok}, "
-        f"zero={zeros}, rpc_error={errors}, clean={len(clean_holders)}"
+        f"Done in {time.time()-t0:.1f}s. "
+        f"raw={len(raw_rows)}, verified={verified_ok}, "
+        f"zero={zeros}, rpc_error={errors}, skipped={skipped}, clean={len(clean_holders)}"
     )
 
 
