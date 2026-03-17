@@ -32,7 +32,7 @@ MIN_CHANGE_PERCENT = 5
 REQUEST_SLEEP_SEC = 0.05   # уменьшили с 0.15
 
 # RPC — динамический batch size
-RPC_BATCH_SIZE_INIT = 80   # стартуем с большего
+RPC_BATCH_SIZE_INIT = 20   # стартуем с большего
 RPC_BATCH_SIZE_MIN = 20
 RPC_BATCH_SIZE_MAX = 120
 RPC_SLEEP_SEC = 0.05       # уменьшили с 0.25
