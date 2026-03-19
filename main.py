@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import random
+import itertools
 from datetime import datetime
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,9 +16,15 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # =========================
 MORALIS_API_KEY = os.environ["MORALIS_API_KEY"]
-BASE_RPC_URL = os.environ["BASE_RPC_URL"]
+BASE_RPC_URL = os.environ["BASE_RPC_URL"]          # Alchemy (primary)
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+# Дополнительные публичные RPC для Base (без ключа)
+FALLBACK_RPC_URLS = [
+    "https://mainnet.base.org",
+    "https://base.llamarpc.com",
+]
 
 TOKEN_ADDRESS = "0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93"
 CHAIN = "base"
@@ -29,17 +37,19 @@ MAX_PAGES = 350
 MIN_BALANCE = 0.001
 MIN_CHANGE_PERCENT = 5
 
-REQUEST_SLEEP_SEC = 0.05   # уменьшили с 0.15
+REQUEST_SLEEP_SEC = 0.05
 
-# RPC — динамический batch size
-RPC_BATCH_SIZE_INIT = 20   # стартуем с большего
-RPC_BATCH_SIZE_MIN = 20
-RPC_BATCH_SIZE_MAX = 120
-RPC_SLEEP_SEC = 0.05       # уменьшили с 0.25
-RPC_MAX_RETRIES_429 = 8
-RPC_RETRY_BASE_SEC = 1.5
-RPC_RETRY_NON429 = 2
-RPC_MAX_WORKERS = 4        # параллельные потоки
+# RPC — фиксированный batch size, без динамического роста
+RPC_BATCH_SIZE = 40           # фиксированный, не растёт
+RPC_BATCH_SIZE_MIN = 15       # минимум при 429
+RPC_SLEEP_SEC = 0.05
+RPC_MAX_RETRIES_429 = 6
+RPC_RETRY_BASE_SEC = 1.2
+RPC_RETRY_NON429 = 3
+RPC_MAX_WORKERS = 2           # 2 воркера — по одному на каждый RPC
+
+# Второй проход для rpc_error
+RPC_RETRY_PASS_BATCH = 20     # меньший батч для ретрая
 
 MORALIS_MAX_RETRIES_429 = 5
 MORALIS_RETRY_BASE_SEC = 3.0
@@ -50,26 +60,39 @@ SHEET_HISTORY = "history"
 SHEET_MOVEMENTS = "movements"
 SHEET_HOLDERS_RAW = "holders_raw"
 
+
 # =========================
-# THREAD-SAFE BATCH SIZE
+# RPC ROUND-ROBIN
 # =========================
+_all_rpc_urls = [BASE_RPC_URL] + FALLBACK_RPC_URLS
+_rpc_cycle = itertools.cycle(_all_rpc_urls)
+_rpc_cycle_lock = threading.Lock()
+
+def next_rpc_url() -> str:
+    with _rpc_cycle_lock:
+        return next(_rpc_cycle)
+
+# Per-RPC динамический batch size (независимо для каждого endpoint)
+_batch_sizes: Dict[str, int] = {url: RPC_BATCH_SIZE for url in _all_rpc_urls}
 _batch_size_lock = threading.Lock()
-_current_batch_size = RPC_BATCH_SIZE_INIT
 
-def get_batch_size() -> int:
+def get_batch_size(rpc_url: str) -> int:
     with _batch_size_lock:
-        return _current_batch_size
+        return _batch_sizes.get(rpc_url, RPC_BATCH_SIZE)
 
-def decrease_batch_size():
-    global _current_batch_size
+def decrease_batch_size(rpc_url: str):
     with _batch_size_lock:
-        _current_batch_size = max(RPC_BATCH_SIZE_MIN, _current_batch_size // 2)
-        print(f"  [RPC] batch size decreased to {_current_batch_size}")
+        cur = _batch_sizes.get(rpc_url, RPC_BATCH_SIZE)
+        new = max(RPC_BATCH_SIZE_MIN, cur // 2)
+        _batch_sizes[rpc_url] = new
+        print(f"  [RPC] {rpc_url[-30:]} batch ↓ {cur}→{new}")
 
-def increase_batch_size():
-    global _current_batch_size
+def reset_batch_size(rpc_url: str):
+    """После успеха возвращаем к базовому, но не растём выше него."""
     with _batch_size_lock:
-        _current_batch_size = min(RPC_BATCH_SIZE_MAX, int(_current_batch_size * 1.2))
+        cur = _batch_sizes.get(rpc_url, RPC_BATCH_SIZE)
+        if cur < RPC_BATCH_SIZE:
+            _batch_sizes[rpc_url] = min(RPC_BATCH_SIZE, cur + 5)
 
 
 # =========================
@@ -91,6 +114,11 @@ def to_tokens(raw: str) -> float:
 def chunks(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
+
+def jitter_sleep(base_sec: float, attempt: int):
+    """Экспоненциальный backoff с jitter чтобы ретраи не синхронизировались."""
+    wait = base_sec * attempt * random.uniform(0.7, 1.4)
+    time.sleep(wait)
 
 
 # =========================
@@ -165,13 +193,13 @@ def moralis_get_json(url: str, attempt: int = 1) -> dict:
     if resp.status_code == 429:
         if attempt >= MORALIS_MAX_RETRIES_429:
             raise RuntimeError(f"Moralis 429 after retries: {resp.text[:300]}")
-        time.sleep(MORALIS_RETRY_BASE_SEC * attempt)
+        jitter_sleep(MORALIS_RETRY_BASE_SEC, attempt)
         return moralis_get_json(url, attempt + 1)
 
     if resp.status_code in (500, 502, 503, 504):
         if attempt >= MORALIS_MAX_RETRIES_429:
             raise RuntimeError(f"Moralis {resp.status_code} after retries: {resp.text[:300]}")
-        time.sleep(MORALIS_RETRY_BASE_SEC * attempt)
+        jitter_sleep(MORALIS_RETRY_BASE_SEC, attempt)
         return moralis_get_json(url, attempt + 1)
 
     resp.raise_for_status()
@@ -220,7 +248,6 @@ def fetch_all_owners() -> List[Dict]:
         seen_cursors.add(next_cursor)
         cursor = next_cursor
 
-        # sleep только каждые 5 страниц
         if page_num % 5 == 4:
             time.sleep(REQUEST_SLEEP_SEC)
 
@@ -239,10 +266,10 @@ def fetch_all_owners() -> List[Dict]:
 def pad64(addr: str) -> str:
     return addr.lower().replace("0x", "").rjust(64, "0")
 
-def is_429_response(resp: requests.Response, body_text: str, json_error=None) -> bool:
+def is_429_like(resp: requests.Response, body_text: str, json_error=None) -> bool:
     if resp.status_code == 429:
         return True
-    if "compute units per second" in body_text:
+    if "compute units per second" in body_text or "throughput" in body_text.lower():
         return True
     if json_error:
         err_text = json.dumps(json_error)
@@ -265,6 +292,7 @@ def make_balance_call(address: str, req_id: int) -> dict:
 
 def rpc_balance_of_batch(
     addresses: List[str],
+    rpc_url: str,
     attempt_429: int = 1,
     attempt_non429: int = 1,
 ) -> Dict[str, Tuple[str, float]]:
@@ -276,28 +304,26 @@ def rpc_balance_of_batch(
         payload.append(make_balance_call(address, idx))
 
     try:
-        resp = requests.post(BASE_RPC_URL, json=payload, timeout=60)
+        resp = requests.post(rpc_url, json=payload, timeout=60)
         body = resp.text
 
-        if is_429_response(resp, body):
-            decrease_batch_size()
+        if is_429_like(resp, body):
+            decrease_batch_size(rpc_url)
             if attempt_429 >= RPC_MAX_RETRIES_429:
-                raise RuntimeError(f"RPC batch 429 after retries: {body[:300]}")
-            wait_sec = RPC_RETRY_BASE_SEC * attempt_429
-            time.sleep(wait_sec)
-            return rpc_balance_of_batch(addresses, attempt_429 + 1, attempt_non429)
+                raise RuntimeError(f"RPC batch 429 after retries ({rpc_url[-30:]}): {body[:200]}")
+            jitter_sleep(RPC_RETRY_BASE_SEC, attempt_429)
+            return rpc_balance_of_batch(addresses, rpc_url, attempt_429 + 1, attempt_non429)
 
         resp.raise_for_status()
         data = resp.json()
 
         if not isinstance(data, list):
             if attempt_non429 <= RPC_RETRY_NON429:
-                time.sleep(1.0 * attempt_non429)
-                return rpc_balance_of_batch(addresses, attempt_429, attempt_non429 + 1)
-            raise RuntimeError(f"Unexpected batch response: {str(data)[:300]}")
+                jitter_sleep(1.0, attempt_non429)
+                return rpc_balance_of_batch(addresses, rpc_url, attempt_429, attempt_non429 + 1)
+            raise RuntimeError(f"Unexpected batch response from {rpc_url[-30:]}: {str(data)[:200]}")
 
-        # Успешный батч — увеличиваем batch size
-        increase_batch_size()
+        reset_batch_size(rpc_url)
 
         out = {address: ("rpc_error", 0.0) for address in addresses}
 
@@ -309,17 +335,12 @@ def rpc_balance_of_batch(
 
             if item.get("error"):
                 err = item["error"]
-                err_text = json.dumps(err)
-
-                if (str(err.get("code")) == "429"
-                        or "compute units per second" in err_text
-                        or "throughput" in err_text.lower()):
-                    decrease_batch_size()
+                if is_429_like(resp, json.dumps(err), err):
+                    decrease_batch_size(rpc_url)
                     if attempt_429 >= RPC_MAX_RETRIES_429:
-                        raise RuntimeError(f"RPC logical 429 after retries: {err_text}")
-                    time.sleep(RPC_RETRY_BASE_SEC * attempt_429)
-                    return rpc_balance_of_batch(addresses, attempt_429 + 1, attempt_non429)
-
+                        raise RuntimeError(f"RPC logical 429 after retries")
+                    jitter_sleep(RPC_RETRY_BASE_SEC, attempt_429)
+                    return rpc_balance_of_batch(addresses, rpc_url, attempt_429 + 1, attempt_non429)
                 out[address] = ("rpc_error", 0.0)
                 continue
 
@@ -332,60 +353,50 @@ def rpc_balance_of_batch(
 
     except Exception as e:
         msg = str(e)
-        if "429" in msg or "compute units per second" in msg:
-            decrease_batch_size()
+        if "429" in msg or "compute units per second" in msg or "throughput" in msg.lower():
+            decrease_batch_size(rpc_url)
             if attempt_429 >= RPC_MAX_RETRIES_429:
                 raise
-            time.sleep(RPC_RETRY_BASE_SEC * attempt_429)
-            return rpc_balance_of_batch(addresses, attempt_429 + 1, attempt_non429)
+            jitter_sleep(RPC_RETRY_BASE_SEC, attempt_429)
+            return rpc_balance_of_batch(addresses, rpc_url, attempt_429 + 1, attempt_non429)
 
         if attempt_non429 <= RPC_RETRY_NON429:
-            time.sleep(1.0 * attempt_non429)
-            return rpc_balance_of_batch(addresses, attempt_429, attempt_non429 + 1)
+            jitter_sleep(1.0, attempt_non429)
+            return rpc_balance_of_batch(addresses, rpc_url, attempt_429, attempt_non429 + 1)
         raise
 
 
 # =========================
-# VERIFY — параллельная
+# VERIFY — round-robin + второй проход
 # =========================
-def verify_all(rows: List[Dict]) -> List[Dict]:
+def run_rpc_pass(
+    addresses: List[str],
+    batch_size: int,
+    label: str = "pass",
+) -> Dict[str, Tuple[str, float]]:
     """
-    Фильтрует адреса с balance < MIN_BALANCE (им не нужна верификация),
-    остальные верифицирует параллельно в RPC_MAX_WORKERS потоках.
+    Один проход по списку адресов: нарезает на батчи,
+    раздаёт их воркерам, каждый батч идёт на следующий RPC из цикла.
     """
-    # Разделяем: мелкие балансы пропускаем RPC
-    skip_rpc = []
-    need_rpc = []
-    for r in rows:
-        if r["moralis_balance"] < MIN_BALANCE:
-            skip_rpc.append(r)
-        else:
-            need_rpc.append(r)
-
-    print(f"  [verify] total={len(rows)}, need_rpc={len(need_rpc)}, skip_rpc={len(skip_rpc)}")
-
     results: Dict[str, Tuple[str, float]] = {}
     lock = threading.Lock()
 
-    def process_batch(batch_addresses: List[str]):
-        batch_result = rpc_balance_of_batch(batch_addresses)
+    batches = list(chunks(addresses, batch_size))
+    print(f"  [{label}] {len(addresses)} addrs → {len(batches)} batches (size={batch_size})")
+
+    def process_batch(batch_addresses: List[str], rpc_url: str):
+        batch_result = rpc_balance_of_batch(batch_addresses, rpc_url)
         time.sleep(RPC_SLEEP_SEC)
         with lock:
             results.update(batch_result)
 
-    # Динамически нарезаем батчи по текущему batch size
-    def dynamic_batches(addr_list):
-        i = 0
-        while i < len(addr_list):
-            size = get_batch_size()
-            yield addr_list[i:i + size]
-            i += size
-
-    addresses = [r["address"] for r in need_rpc]
-    batches = list(dynamic_batches(addresses))
-
     with ThreadPoolExecutor(max_workers=RPC_MAX_WORKERS) as executor:
-        futures = {executor.submit(process_batch, b): b for b in batches}
+        futures = {}
+        for batch in batches:
+            rpc_url = next_rpc_url()   # round-robin
+            f = executor.submit(process_batch, batch, rpc_url)
+            futures[f] = rpc_url
+
         done = 0
         for future in as_completed(futures):
             try:
@@ -393,24 +404,40 @@ def verify_all(rows: List[Dict]) -> List[Dict]:
             except Exception as e:
                 print(f"  [warn] batch error: {e}")
             done += 1
-            if done % 10 == 0:
-                print(f"  [verify] {done}/{len(batches)} batches done")
+            if done % 20 == 0 or done == len(futures):
+                print(f"  [{label}] {done}/{len(futures)} batches done")
 
-    # Собираем результат
+    return results
+
+def verify_all(rows: List[Dict]) -> List[Dict]:
+    skip_rpc = [r for r in rows if r["moralis_balance"] < MIN_BALANCE]
+    need_rpc  = [r for r in rows if r["moralis_balance"] >= MIN_BALANCE]
+
+    print(f"  [verify] total={len(rows)}, need_rpc={len(need_rpc)}, skip_rpc={len(skip_rpc)}")
+
+    # Первый проход
+    addresses = [r["address"] for r in need_rpc]
+    results = run_rpc_pass(addresses, RPC_BATCH_SIZE, label="pass1")
+
+    # Второй проход — только rpc_error адреса, меньший батч
+    error_addrs = [a for a, (status, _) in results.items() if status == "rpc_error"]
+    if error_addrs:
+        print(f"  [pass2] retrying {len(error_addrs)} rpc_error addresses...")
+        results2 = run_rpc_pass(error_addrs, RPC_RETRY_PASS_BATCH, label="pass2")
+        results.update(results2)  # перезаписываем ошибки улучшенными результатами
+
+    # Собираем финальный список
     verified = []
-
     for r in need_rpc:
         address = r["address"]
-        moralis_balance = r["moralis_balance"]
         status, live_balance = results.get(address, ("rpc_error", 0.0))
         verified.append({
             "address": address,
-            "moralis_balance": moralis_balance,
+            "moralis_balance": r["moralis_balance"],
             "verified_balance": live_balance if status != "rpc_error" else "",
             "verify_status": status,
         })
 
-    # Мелкие балансы — доверяем Moralis, ставим статус "skipped"
     for r in skip_rpc:
         verified.append({
             "address": r["address"],
@@ -441,7 +468,7 @@ def analyze_movements(
 
         if prev_bal > 0:
             change = now_bal - prev_bal
-            change_pct = (change / prev_bal) * 100 if prev_bal else 0
+            change_pct = (change / prev_bal) * 100
             if abs(change_pct) >= MIN_CHANGE_PERCENT:
                 movements.append({
                     "address": addr,
@@ -601,9 +628,9 @@ def main():
     print(f"  Sheets written in {time.time()-t2:.1f}s")
 
     verified_ok = sum(1 for r in verified_rows if r["verify_status"] == "verified")
-    zeros = sum(1 for r in verified_rows if r["verify_status"] == "zero")
-    errors = sum(1 for r in verified_rows if r["verify_status"] == "rpc_error")
-    skipped = sum(1 for r in verified_rows if r["verify_status"] == "skipped")
+    zeros      = sum(1 for r in verified_rows if r["verify_status"] == "zero")
+    errors     = sum(1 for r in verified_rows if r["verify_status"] == "rpc_error")
+    skipped    = sum(1 for r in verified_rows if r["verify_status"] == "skipped")
 
     print(
         f"Done in {time.time()-t0:.1f}s. "
